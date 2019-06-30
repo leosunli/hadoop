@@ -1396,6 +1396,14 @@
 </property>
 
 <property>
+  <name>dfs.namenode.imageload</name>
+  <value></value>
+  <description>
+    The prefix for keys to control params of image loading process.
+  </description>
+</property>
+
+<property>
   <name>dfs.edit.log.transfer.bandwidthPerSec</name>
   <value>0</value>
   <description>

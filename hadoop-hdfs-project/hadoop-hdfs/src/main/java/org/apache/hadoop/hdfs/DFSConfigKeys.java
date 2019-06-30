@@ -877,6 +877,8 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   // Image transfer chunksize
   public static final String DFS_IMAGE_TRANSFER_CHUNKSIZE_KEY = "dfs.image.transfer.chunksize";
   public static final int DFS_IMAGE_TRANSFER_CHUNKSIZE_DEFAULT = 64 * 1024;
+  
+  public static final String DFS_NAMENODE_IMAGELOAD_KEY_PREFIX = "dfs.namenode.imageload";
 
   // Edit Log segment transfer timeout
   public static final String DFS_EDIT_LOG_TRANSFER_TIMEOUT_KEY =
@@ -1298,6 +1300,7 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
 
   public static final String DFS_NET_TOPOLOGY_IMPL_KEY =
       "dfs.net.topology.impl";
+
 
   public static final Class<DFSNetworkTopology> DFS_NET_TOPOLOGY_IMPL_DEFAULT =
       DFSNetworkTopology.class;
