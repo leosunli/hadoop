@@ -318,14 +318,14 @@ public final class FSImageFormatProtobuf {
         case INODE: {
           currentStep = new Step(StepType.INODES);
           prog.beginStep(Phase.LOADING_FSIMAGE, currentStep);
-          inodeLoader.loadINodeSection(in, prog, currentStep);
+          inodeLoader.loadINodeSection(in, prog, currentStep, conf);
         }
           break;
         case INODE_REFERENCE:
           snapshotLoader.loadINodeReferenceSection(in);
           break;
         case INODE_DIR:
-          inodeLoader.loadINodeDirectorySection(in);
+          inodeLoader.loadINodeDirectorySection(in, conf);
           break;
         case FILES_UNDERCONSTRUCTION:
           inodeLoader.loadFilesUnderConstructionSection(in);

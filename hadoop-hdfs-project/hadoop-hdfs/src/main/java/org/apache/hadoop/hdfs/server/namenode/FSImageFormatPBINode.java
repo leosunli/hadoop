@@ -26,6 +26,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 
+import org.apache.hadoop.conf.Configuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
@@ -34,6 +35,7 @@ import org.apache.hadoop.fs.permission.AclEntry;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.fs.XAttr;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
@@ -64,6 +66,8 @@ import org.apache.hadoop.hdfs.server.namenode.startupprogress.StartupProgress;
 import org.apache.hadoop.hdfs.server.namenode.startupprogress.StartupProgress.Counter;
 import org.apache.hadoop.hdfs.server.namenode.startupprogress.Step;
 import org.apache.hadoop.hdfs.util.EnumCounters;
+import org.apache.hadoop.util.PipelineTask;
+import org.apache.hadoop.util.PipelineTask.PipelineWork;
 import org.apache.hadoop.hdfs.util.ReadOnlyList;
 
 import com.google.common.base.Preconditions;
@@ -204,45 +208,138 @@ public final class FSImageFormatPBINode {
       this.parent = parent;
     }
 
-    void loadINodeDirectorySection(InputStream in) throws IOException {
-      final List<INodeReference> refList = parent.getLoaderContext()
-          .getRefList();
-      while (true) {
-        INodeDirectorySection.DirEntry e = INodeDirectorySection.DirEntry
-            .parseDelimitedFrom(in);
-        // note that in is a LimitedInputStream
-        if (e == null) {
-          break;
+    void loadINodeDirectorySection(InputStream in, final Configuration conf)
+        throws IOException {
+      final List<INodeReference> refList =
+          parent.getLoaderContext().getRefList();
+      PipelineTask task = new PipelineTask(conf,
+          DFSConfigKeys.DFS_NAMENODE_IMAGELOAD_KEY_PREFIX);
+      if (conf.get(task
+          .getBlockingThresholdKey("INodeDirectorySectionLoader")) == null) {
+        conf.setInt(task.getBlockingThresholdKey("INodeDirectorySectionLoader"),
+            20);
+      }
+      if (conf.get(task
+          .getTransferThresholdKey("INodeDirectorySectionLoader")) == null) {
+        conf.setInt(task.getTransferThresholdKey("INodeDirectorySectionLoader"),
+            10);
+      }
+      if (conf
+          .get(task.getBlockingThresholdKey("DirectoryInitializer")) == null) {
+        conf.setInt(task.getBlockingThresholdKey("DirectoryInitializer"), 1000);
+      }
+      if (conf
+          .get(task.getTransferThresholdKey("DirectoryInitializer")) == null) {
+        conf.setInt(task.getTransferThresholdKey("DirectoryInitializer"), 10);
+      }
+      if (conf.get(task.getNumThreadsKey("DirectoryInitializer")) == null) {
+        conf.setInt(task.getNumThreadsKey("DirectoryInitializer"), 32);
+      }
+      task.appendWork(new PipelineWork<Void, INodeDirectorySection.DirEntry>() {
+        @Override
+        public INodeDirectorySection.DirEntry doWork(Void obj)
+            throws IOException {
+          return INodeDirectorySection.DirEntry.parseDelimitedFrom(in);
         }
-        INodeDirectory p = dir.getInode(e.getParent()).asDirectory();
-        for (long id : e.getChildrenList()) {
-          INode child = dir.getInode(id);
-          addToParent(p, child);
-        }
-        for (int refId : e.getRefChildrenList()) {
-          INodeReference ref = refList.get(refId);
-          addToParent(p, ref);
-        }
+      }, "INodeDirectorySectionLoader")
+          .appendWork(new PipelineWork<INodeDirectorySection.DirEntry, Void>() {
+            @Override
+            public Void doWork(INodeDirectorySection.DirEntry e) {
+              INodeDirectory p = dir.getInode(e.getParent()).asDirectory();
+              for (long id : e.getChildrenList()) {
+                INode child = dir.getInode(id);
+                addToParent(p, child);
+              }
+              for (int refId : e.getRefChildrenList()) {
+                INodeReference ref = refList.get(refId);
+                addToParent(p, ref);
+                dir.cacheName(ref);
+                if (ref.isFile()) {
+                  updateBlocksMap(ref.asFile(), fsn.getBlockManager());
+                }
+              }
+              return null;
+            }
+          }, "DirectoryInitializer");
+
+      task.kickOff();
+      try {
+        task.join();
+      } catch (InterruptedException ie) {
+        throw new IOException(ie);
+      }
+      Throwable t = task.getException();
+      if (t != null) {
+        throw new IOException(t);
       }
     }
 
     void loadINodeSection(InputStream in, StartupProgress prog,
-        Step currentStep) throws IOException {
+        Step currentStep, final Configuration conf) throws IOException {
       INodeSection s = INodeSection.parseDelimitedFrom(in);
       fsn.dir.resetLastInodeId(s.getLastInodeId());
       long numInodes = s.getNumInodes();
       LOG.info("Loading " + numInodes + " INodes.");
       prog.setTotal(Phase.LOADING_FSIMAGE, currentStep, numInodes);
       Counter counter = prog.getCounter(Phase.LOADING_FSIMAGE, currentStep);
-      for (int i = 0; i < numInodes; ++i) {
-        INodeSection.INode p = INodeSection.INode.parseDelimitedFrom(in);
-        if (p.getId() == INodeId.ROOT_INODE_ID) {
-          loadRootINode(p);
-        } else {
-          INode n = loadINode(p);
-          dir.addToInodeMap(n);
+      /*
+       * for (int i = 0; i < numInodes; ++i) { INodeSection.INode p =
+       * INodeSection.INode.parseDelimitedFrom(in); if (p.getId() ==
+       * INodeId.ROOT_INODE_ID) { loadRootINode(p); } else { INode n =
+       * loadINode(p); dir.addToInodeMap(n); } counter.increment(); }
+       */
+      PipelineTask task = new PipelineTask(conf,
+          DFSConfigKeys.DFS_NAMENODE_IMAGELOAD_KEY_PREFIX);
+      task = task.appendWork(new PipelineWork<Void, INodeSection.INode>() {
+        int readed = 0;
+
+        @Override
+        public INodeSection.INode doWork(Void obj) throws IOException {
+          do {
+            if (readed < s.getNumInodes()) {
+              readed++;
+              INodeSection.INode p = INodeSection.INode.parseDelimitedFrom(in);
+              if (p.getId() == INodeId.ROOT_INODE_ID) {
+                loadRootINode(p);
+              } else {
+                return p;
+              }
+            } else {
+              return null;
+            }
+          } while (true);
         }
-        counter.increment();
+      }, "INodeSectionLoader")
+          .appendWork(new PipelineWork<INodeSection.INode, INode>() {
+            @Override
+            public INode doWork(INodeSection.INode item) {
+              return loadINode(item);
+            }
+          }, "INodeInitializer").appendWork(new PipelineWork<INode, Void>() {
+            @Override
+            public Void doWork(INode node) {
+              dir.addToInodeMap(node);
+              dir.cacheName(node);
+              if (node.isFile()) {
+                updateBlocksMap(node.asFile(), fsn.getBlockManager());
+              }
+              return null;
+            }
+          }, "INodeMapAdder");
+
+      task.kickOff();
+      try {
+        task.join();
+      } catch (InterruptedException ie) {
+        throw new IOException(ie);
+      }
+      Throwable t = task.getException();
+      if (t != null) {
+        if (t instanceof IOException) {
+          throw (IOException) t;
+        } else {
+          throw new IOException(t);
+        }
       }
     }
 
@@ -272,11 +369,12 @@ public final class FSImageFormatPBINode {
       if (!parent.addChildAtLoading(child)) {
         return;
       }
-      dir.cacheName(child);
-
-      if (child.isFile()) {
-        updateBlocksMap(child.asFile(), fsn.getBlockManager());
-      }
+      /*
+       * dir.cacheName(child);
+       * 
+       * if (child.isFile()) { updateBlocksMap(child.asFile(),
+       * fsn.getBlockManager()); }
+       */
     }
 
     private INode loadINode(INodeSection.INode n) {
